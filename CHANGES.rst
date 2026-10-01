@@ -3,6 +3,9 @@ Version 1.10.0
 
 Unreleased
 
+-   Add ``Signal.send_robust`` and ``Signal.send_robust_async`` to collect
+    receiver exceptions while continuing to call the remaining receivers.
+
 
 Version 1.9.0
 -------------

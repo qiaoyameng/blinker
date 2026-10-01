@@ -240,13 +240,56 @@ class Signal:
         results = []
 
         for receiver in self.receivers_for(sender):
-            if iscoroutinefunction(receiver):
-                if _async_wrapper is None:
-                    raise RuntimeError("Cannot send to a coroutine function.")
+            result = self._send_to_receiver(
+                receiver, sender, kwargs, async_wrapper=_async_wrapper
+            )
 
-                result = _async_wrapper(receiver)(sender, **kwargs)
-            else:
-                result = receiver(sender, **kwargs)
+            results.append((receiver, result))
+
+        return results
+
+    def send_robust(
+        self,
+        sender: t.Any | None = None,
+        /,
+        *,
+        _async_wrapper: c.Callable[
+            [c.Callable[..., c.Coroutine[t.Any, t.Any, t.Any]]], c.Callable[..., t.Any]
+        ]
+        | None = None,
+        **kwargs: t.Any,
+    ) -> list[tuple[c.Callable[..., t.Any], t.Any]]:
+        """Call receivers, collecting exceptions instead of stopping.
+
+        Return a list of ``(receiver, result)`` tuples. When a receiver raises
+        an :class:`Exception`, the exception object is used as the result, with
+        its traceback intact, and remaining receivers are still called.
+        :class:`BaseException` errors such as :class:`KeyboardInterrupt` and
+        :class:`SystemExit` are not caught.
+
+        If an async receiver cannot be called because no ``_async_wrapper``
+        was supplied, the resulting :class:`RuntimeError` is returned for that
+        receiver.
+
+        :param _async_wrapper: Will be called on any receivers that are async
+            coroutines to turn them into sync callables.
+
+        The other arguments are the same as :meth:`send`.
+
+        .. versionadded:: 1.10
+        """
+        if self.is_muted:
+            return []
+
+        results = []
+
+        for receiver in self.receivers_for(sender):
+            try:
+                result = self._send_to_receiver(
+                    receiver, sender, kwargs, async_wrapper=_async_wrapper
+                )
+            except Exception as exc:
+                result = exc
 
             results.append((receiver, result))
 
@@ -290,17 +333,101 @@ class Signal:
         results = []
 
         for receiver in self.receivers_for(sender):
-            if not iscoroutinefunction(receiver):
-                if _sync_wrapper is None:
-                    raise RuntimeError("Cannot send to a non-coroutine function.")
-
-                result = await _sync_wrapper(receiver)(sender, **kwargs)
-            else:
-                result = await receiver(sender, **kwargs)
+            result = await self._send_to_receiver_async(
+                receiver, sender, kwargs, sync_wrapper=_sync_wrapper
+            )
 
             results.append((receiver, result))
 
         return results
+
+    async def send_robust_async(
+        self,
+        sender: t.Any | None = None,
+        /,
+        *,
+        _sync_wrapper: c.Callable[
+            [c.Callable[..., t.Any]], c.Callable[..., c.Coroutine[t.Any, t.Any, t.Any]]
+        ]
+        | None = None,
+        **kwargs: t.Any,
+    ) -> list[tuple[c.Callable[..., t.Any], t.Any]]:
+        """Await receivers, collecting exceptions instead of stopping.
+
+        Return a list of ``(receiver, result)`` tuples. When a receiver raises
+        an :class:`Exception`, the exception object is used as the result, with
+        its traceback intact, and remaining receivers are still awaited.
+        :class:`BaseException` errors and cancellation are not caught.
+
+        If a sync receiver cannot be called because no ``_sync_wrapper``
+        was supplied, the resulting :class:`RuntimeError` is returned for that
+        receiver.
+
+        :param _sync_wrapper: Will be called on any receivers that are sync
+            callables to turn them into async coroutines.
+
+        The other arguments are the same as :meth:`send_async`.
+
+        .. versionadded:: 1.10
+        """
+        if self.is_muted:
+            return []
+
+        results = []
+
+        for receiver in self.receivers_for(sender):
+            try:
+                result = await self._send_to_receiver_async(
+                    receiver, sender, kwargs, sync_wrapper=_sync_wrapper
+                )
+            except Exception as exc:
+                result = exc
+
+            results.append((receiver, result))
+
+        return results
+
+    send_async_robust = send_robust_async
+
+    @staticmethod
+    def _send_to_receiver(
+        receiver: c.Callable[..., t.Any],
+        sender: t.Any | None,
+        kwargs: dict[str, t.Any],
+        *,
+        async_wrapper: c.Callable[
+            [c.Callable[..., c.Coroutine[t.Any, t.Any, t.Any]]], c.Callable[..., t.Any]
+        ]
+        | None,
+    ) -> t.Any:
+        if iscoroutinefunction(receiver):
+            if async_wrapper is None:
+                raise RuntimeError("Cannot send to a coroutine function.")
+
+            return async_wrapper(receiver)(sender, **kwargs)
+
+        return receiver(sender, **kwargs)
+
+    @staticmethod
+    async def _send_to_receiver_async(
+        receiver: c.Callable[..., t.Any],
+        sender: t.Any | None,
+        kwargs: dict[str, t.Any],
+        *,
+        sync_wrapper: c.Callable[
+            [c.Callable[..., t.Any]], c.Callable[..., c.Coroutine[t.Any, t.Any, t.Any]]
+        ]
+        | None,
+    ) -> t.Any:
+        if iscoroutinefunction(receiver):
+            result = receiver(sender, **kwargs)
+        else:
+            if sync_wrapper is None:
+                raise RuntimeError("Cannot send to a non-coroutine function.")
+
+            result = sync_wrapper(receiver)(sender, **kwargs)
+
+        return await result
 
     def has_receivers_for(self, sender: t.Any) -> bool:
         """Check if there is at least one receiver that will be called with the

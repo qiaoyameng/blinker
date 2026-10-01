@@ -331,7 +331,29 @@ event loop the following example can be used:
 
        return inner
 
-   await sig.send(_async_wrapper=wrapper)
+   sig.send(_async_wrapper=wrapper)
+
+
+Robust sending
+--------------
+
+By default, :meth:`~Signal.send` and :meth:`~Signal.send_async` stop at the
+first exception. Use :meth:`~Signal.send_robust` or
+:meth:`~Signal.send_robust_async` to continue broadcasting after a receiver
+raises a normal :class:`Exception`. Each result is a
+``(receiver, return_value_or_exception)`` tuple. The exception object itself is
+returned, so its type and traceback are preserved.
+
+.. code-block:: python
+
+   for receiver, result in sig.send_robust():
+       if isinstance(result, Exception):
+           ...  # Handle result.__traceback__ or log the exception object.
+
+Errors that inherit directly from :class:`BaseException`, including
+:class:`KeyboardInterrupt` and :class:`SystemExit`, continue to propagate. The
+asynchronous method also lets cancellation propagate; if a receiver is
+cancelled, later receivers are not awaited.
 
 
 Call receivers in order of registration
