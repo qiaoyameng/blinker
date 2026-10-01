@@ -3,6 +3,10 @@ Version 1.10.0
 
 Unreleased
 
+-   ``Signal.connected_to`` only removes the connection added by its context,
+    preserving existing sender and ``ANY`` connections as well as the original
+    weak reference state.
+
 
 Version 1.9.0
 -------------
