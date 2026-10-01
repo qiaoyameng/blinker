@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import asyncio
 import collections.abc as c
 import gc
 import sys
+import threading
 import typing as t
 
 import pytest
@@ -478,6 +480,157 @@ def test_mute_signal() -> None:
     with sig.muted():
         sig.send(456)
     assert 456 not in sentinel
+
+
+def test_mute_signal_for_sender() -> None:
+    sentinel = []
+
+    def received(sender: t.Any) -> None:
+        sentinel.append(sender)
+
+    sig = blinker.Signal()
+    sig.connect(received)
+
+    with sig.muted_for(123):
+        sig.send(123)
+        sig.send(456)
+
+    sig.send(123)
+
+    assert sentinel == [456, 123]
+
+
+def test_mute_signal_for_all_senders() -> None:
+    sentinel = []
+
+    def received(sender: t.Any) -> None:
+        sentinel.append(sender)
+
+    sig = blinker.Signal()
+    sig.connect(received)
+
+    with sig.muted_for():
+        sig.send(123)
+        sig.send(456)
+
+    assert sentinel == []
+
+
+def test_nested_muted_for_union_and_restore() -> None:
+    sentinel = []
+
+    def received(sender: t.Any) -> None:
+        sentinel.append(sender)
+
+    sig = blinker.Signal()
+    sig.connect(received)
+
+    with sig.muted_for(123):
+        sig.send(123)
+        sig.send(456)
+
+        with sig.muted_for(789):
+            sig.send(789)
+
+        sig.send(123)
+        sig.send(789)
+
+    sig.send(123)
+
+    assert sentinel == [456, 789, 123]
+
+
+@pytest.mark.parametrize(
+    "exc_type", [RuntimeError, BaseException], ids=["exception", "base-exception"]
+)
+def test_muted_for_restores_after_exception(exc_type: type[BaseException]) -> None:
+    sentinel = []
+
+    def received(sender: t.Any) -> None:
+        sentinel.append(sender)
+
+    sig = blinker.Signal()
+    sig.connect(received)
+
+    with pytest.raises(exc_type):
+        with sig.muted_for(123):
+            raise exc_type
+
+    sig.send(123)
+    assert sentinel == [123]
+
+
+def test_muted_for_is_context_local_to_thread() -> None:
+    sig = blinker.Signal()
+    sentinel = []
+    can_enter_mute = threading.Event()
+    thread_entered_mute = threading.Event()
+    can_exit_mute = threading.Event()
+
+    def received(sender: t.Any) -> None:
+        sentinel.append(sender)
+
+    sig.connect(received)
+
+    def mute_in_other_thread() -> None:
+        can_enter_mute.wait(1)
+
+        with sig.muted_for("other-thread"):
+            thread_entered_mute.set()
+            can_exit_mute.wait(1)
+
+        sig.send("other-thread")
+
+    thread = threading.Thread(target=mute_in_other_thread, daemon=True)
+    thread.start()
+    can_enter_mute.set()
+    assert thread_entered_mute.wait(1)
+
+    with sig.muted_for("current-thread"):
+        sig.send("other-thread")
+        sig.send("current-thread")
+
+    can_exit_mute.set()
+    thread.join(1)
+    assert not thread.is_alive()
+
+    assert sentinel == ["other-thread", "other-thread"]
+
+
+async def test_muted_for_is_context_local_to_asyncio_tasks() -> None:
+    sig = blinker.Signal()
+    sentinel = []
+
+    async def received(sender: t.Any) -> None:
+        sentinel.append(sender)
+
+    sig.connect(received)
+
+    muted_task_entered = asyncio.Event()
+    exit_inner_mute = asyncio.Event()
+    outer_mute_send_done = asyncio.Event()
+
+    async def muted_task() -> None:
+        with sig.muted_for("muted"):
+            with sig.muted_for("nested"):
+                muted_task_entered.set()
+                await exit_inner_mute.wait()
+
+            await sig.send_async("muted")
+            outer_mute_send_done.set()
+            await asyncio.sleep(0)
+
+    async def receiving_task() -> None:
+        await muted_task_entered.wait()
+        await sig.send_async("other-task")
+        exit_inner_mute.set()
+        await outer_mute_send_done.wait()
+
+    await asyncio.gather(muted_task(), receiving_task())
+
+    await sig.send_async("muted")
+
+    assert sentinel == ["other-task", "muted"]
 
 
 def values_are_empty_sets_(dictionary: dict[t.Any, t.Any]) -> None:

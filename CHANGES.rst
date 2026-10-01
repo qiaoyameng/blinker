@@ -3,6 +3,10 @@ Version 1.10.0
 
 Unreleased
 
+-   Add ``Signal.muted_for`` to mute a signal for one sender within the current
+    thread or asyncio task. Nested scopes combine their muted senders, while
+    other execution contexts continue receiving signals.
+
 
 Version 1.9.0
 -------------

@@ -6,6 +6,7 @@ import typing as t
 import weakref
 from collections import defaultdict
 from contextlib import contextmanager
+from contextvars import ContextVar
 from functools import cached_property
 from inspect import iscoroutinefunction
 
@@ -19,6 +20,11 @@ ANY = Symbol("ANY")
 """Symbol for "any sender"."""
 
 ANY_ID = 0
+
+_LocalMutes = dict["Signal", set[c.Hashable]]
+_local_mutes: ContextVar[t.Optional[_LocalMutes]] = ContextVar(
+    "blinker_local_mutes", default=None
+)
 
 
 class Signal:
@@ -192,7 +198,8 @@ class Signal:
     def muted(self) -> c.Generator[None, None, None]:
         """A context manager that temporarily disables the signal. No receivers
         will be called if the signal is sent, until the ``with`` block exits.
-        Useful for tests.
+        This affects all threads and tasks that send while the block is active.
+        Use :meth:`muted_for` to mute only within the current execution context.
         """
         self.is_muted = True
 
@@ -200,6 +207,53 @@ class Signal:
             yield None
         finally:
             self.is_muted = False
+
+    @contextmanager
+    def muted_for(self, sender: t.Any = ANY) -> c.Generator[None, None, None]:
+        """Temporarily prevent this signal from calling receivers in the current
+        execution context.
+
+        If ``sender`` is given, only signals sent by that sender are muted. If
+        omitted, all senders are muted. Nested blocks mute the union of their
+        senders. Other threads and asyncio tasks continue to receive signals.
+
+        .. versionadded:: 1.10
+        """
+        state = _local_mutes.get()
+
+        if state is None:
+            next_state: _LocalMutes = {}
+        else:
+            next_state = {
+                signal: muted_senders.copy()
+                for signal, muted_senders in state.items()
+            }
+
+        next_state.setdefault(self, set()).add(
+            ANY_ID if sender is ANY else make_id(sender)
+        )
+        token = _local_mutes.set(next_state)
+
+        try:
+            yield None
+        finally:
+            _local_mutes.reset(token)
+
+    def _is_locally_muted(self, sender: t.Any) -> bool:
+        state = _local_mutes.get()
+
+        if state is None:
+            return False
+
+        muted_senders = state.get(self)
+
+        if not muted_senders:
+            return False
+
+        if ANY_ID in muted_senders:
+            return True
+
+        return make_id(sender) in muted_senders
 
     def send(
         self,
@@ -234,7 +288,7 @@ class Signal:
         .. versionchanged:: 1.7
             Added the ``_async_wrapper`` argument.
         """
-        if self.is_muted:
+        if self.is_muted or self._is_locally_muted(sender):
             return []
 
         results = []
@@ -284,7 +338,7 @@ class Signal:
 
         .. versionadded:: 1.7
         """
-        if self.is_muted:
+        if self.is_muted or self._is_locally_muted(sender):
             return []
 
         results = []

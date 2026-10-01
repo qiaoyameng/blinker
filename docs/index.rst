@@ -162,14 +162,24 @@ value``) pairs:
 Muting signals
 --------------
 
-To mute a signal, as may be required when testing, the
-:meth:`~Signal.muted` can be used as a context decorator:
+To mute a signal for every sender in every execution context, the
+:meth:`~Signal.muted` context manager can be used:
 
 .. code-block:: python
 
   sig = signal('send-data')
   with sig.muted():
        ...
+
+
+To mute a signal only for the current thread or asyncio task, use
+:meth:`~Signal.muted_for`. It can also limit the mute to one sender while
+other senders and other execution contexts continue to receive signals:
+
+.. code-block:: python
+
+  with sig.muted_for(sender):
+      ...
 
 
 Anonymous Signals
