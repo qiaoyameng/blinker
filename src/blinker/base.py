@@ -133,7 +133,7 @@ class Signal:
                 )
             except TypeError:
                 # TODO no explanation or test for this
-                self.disconnect(receiver, sender)
+                self._disconnect_from_sender(receiver_id, sender_id)
                 raise
 
         return receiver
@@ -169,8 +169,9 @@ class Signal:
         self, receiver: c.Callable[..., t.Any], sender: t.Any = ANY
     ) -> c.Generator[None, None, None]:
         """A context manager that temporarily connects ``receiver`` to the
-        signal while a ``with`` block executes. When the block exits, the
-        receiver is disconnected. Useful for tests.
+        signal while a ``with`` block executes. When the block exits, only the
+        connection created by this context is removed. Other sender-specific,
+        :data:`ANY`, and weak connections are preserved. Useful for tests.
 
         :param receiver: The callable to call when :meth:`send` is called with
             the given ``sender``, passing ``sender`` as a positional argument
@@ -181,12 +182,50 @@ class Signal:
 
         .. versionadded:: 1.1
         """
-        self.connect(receiver, sender=sender, weak=False)
+        receiver_id = make_id(receiver)
+        sender_id = ANY_ID if sender is ANY else make_id(sender)
+        receiver_senders = self._by_receiver.get(receiver_id)
+        receiver_connected = bool(receiver_senders)
+        receiver_entry_created = not receiver_connected
+        sender_connected = (
+            receiver_senders is not None and sender_id in receiver_senders
+        )
+
+        if not sender_connected:
+            receiver_ref = self.receivers.get(receiver_id)
+            weak = receiver_connected and isinstance(
+                receiver_ref, weakref.ref
+            )
+            self.connect(receiver, sender=sender, weak=weak)
 
         try:
             yield None
         finally:
-            self.disconnect(receiver)
+            if not sender_connected:
+                sender_receivers = self._by_sender.get(sender_id)
+
+                if sender_receivers is not None and receiver_id in sender_receivers:
+                    disconnected = True
+                    self._disconnect_from_sender(receiver_id, sender_id)
+
+                    if not sender_receivers:
+                        self._by_sender.pop(sender_id, None)
+
+                    receiver_senders = self._by_receiver.get(receiver_id)
+
+                    if receiver_entry_created and not receiver_senders:
+                        self._by_receiver.pop(receiver_id, None)
+                        self.receivers.pop(receiver_id, None)
+                else:
+                    disconnected = False
+
+                if disconnected and (
+                    "receiver_disconnected" in self.__dict__
+                    and self.receiver_disconnected.receivers
+                ):
+                    self.receiver_disconnected.send(
+                        self, receiver=receiver, sender=sender
+                    )
 
     @contextmanager
     def muted(self) -> c.Generator[None, None, None]:
@@ -354,14 +393,16 @@ class Signal:
                 strong = receiver()
 
                 if strong is None:
-                    self._disconnect(receiver_id, ANY_ID)
+                    self._disconnect(receiver_id)
                     continue
 
                 yield strong
             else:
                 yield receiver
 
-    def disconnect(self, receiver: c.Callable[..., t.Any], sender: t.Any = ANY) -> None:
+    def disconnect(
+        self, receiver: c.Callable[..., t.Any], sender: t.Any = ANY
+    ) -> None:
         """Disconnect ``receiver`` from being called when the signal is sent by
         ``sender``.
 
@@ -369,32 +410,45 @@ class Signal:
         :param sender: Disconnect from only this sender. By default, disconnect
             from all senders.
         """
-        sender_id: c.Hashable
-
+        receiver_id = make_id(receiver)
         if sender is ANY:
-            sender_id = ANY_ID
+            had_connection = bool(self._by_receiver.get(receiver_id)) or (
+                receiver_id in self.receivers
+            )
+            self._disconnect(receiver_id)
         else:
             sender_id = make_id(sender)
+            had_connection = receiver_id in self._by_sender.get(sender_id, ())
+            self._disconnect_from_sender(receiver_id, sender_id)
 
-        receiver_id = make_id(receiver)
-        self._disconnect(receiver_id, sender_id)
-
-        if (
+        if had_connection and (
             "receiver_disconnected" in self.__dict__
             and self.receiver_disconnected.receivers
         ):
             self.receiver_disconnected.send(self, receiver=receiver, sender=sender)
 
-    def _disconnect(self, receiver_id: c.Hashable, sender_id: c.Hashable) -> None:
-        if sender_id == ANY_ID:
-            if self._by_receiver.pop(receiver_id, None) is not None:
-                for bucket in self._by_sender.values():
-                    bucket.discard(receiver_id)
+    def _disconnect(
+        self,
+        receiver_id: c.Hashable,
+    ) -> None:
+        if self._by_receiver.pop(receiver_id, None) is not None:
+            for bucket in self._by_sender.values():
+                bucket.discard(receiver_id)
 
-            self.receivers.pop(receiver_id, None)
-        else:
-            self._by_sender[sender_id].discard(receiver_id)
-            self._by_receiver[receiver_id].discard(sender_id)
+        self.receivers.pop(receiver_id, None)
+
+    def _disconnect_from_sender(
+        self, receiver_id: c.Hashable, sender_id: c.Hashable
+    ) -> None:
+        sender_receivers = self._by_sender.get(sender_id)
+
+        if sender_receivers is not None:
+            sender_receivers.discard(receiver_id)
+
+        receiver_senders = self._by_receiver.get(receiver_id)
+
+        if receiver_senders is not None:
+            receiver_senders.discard(sender_id)
 
     def _make_cleanup_receiver(
         self, receiver_id: c.Hashable
@@ -407,7 +461,7 @@ class Signal:
             # If the interpreter is shutting down, disconnecting can result in a
             # weird ignored exception. Don't call it in that case.
             if not sys.is_finalizing():
-                self._disconnect(receiver_id, ANY_ID)
+                self._disconnect(receiver_id)
 
         return cleanup
 

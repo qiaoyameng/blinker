@@ -3,6 +3,10 @@ Version 1.10.0
 
 Unreleased
 
+-   Fix ``Signal.connected_to`` so exiting the context removes only its
+    temporary receiver/sender connection and preserves pre-existing sender,
+    ``ANY``, and weak receiver connections.
+
 
 Version 1.9.0
 -------------
