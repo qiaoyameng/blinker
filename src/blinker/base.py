@@ -6,6 +6,7 @@ import typing as t
 import weakref
 from collections import defaultdict
 from contextlib import contextmanager
+from contextvars import ContextVar
 from functools import cached_property
 from inspect import iscoroutinefunction
 
@@ -19,6 +20,8 @@ ANY = Symbol("ANY")
 """Symbol for "any sender"."""
 
 ANY_ID = 0
+
+_MutedSenders = frozenset[t.Hashable]
 
 
 class Signal:
@@ -84,6 +87,9 @@ class Signal:
         """
 
         self.is_muted: bool = False
+        self._muted_senders: ContextVar[_MutedSenders | None] = ContextVar(
+            f"blinker_signal_{id(self)}_muted_senders", default=None
+        )
         self._by_receiver: dict[t.Any, set[t.Any]] = defaultdict(self.set_class)
         self._by_sender: dict[t.Any, set[t.Any]] = defaultdict(self.set_class)
         self._weak_senders: dict[t.Any, weakref.ref[t.Any]] = {}
@@ -201,6 +207,44 @@ class Signal:
         finally:
             self.is_muted = False
 
+    @contextmanager
+    def muted_for(self, sender: t.Any = ANY) -> c.Generator[None, None, None]:
+        """A context manager that temporarily disables the signal for the
+        current execution context. By default, all senders are muted. When a
+        ``sender`` is given, only sends using that sender are muted.
+
+        Nested contexts mute the union of their senders. The mute does not
+        affect other threads or asyncio tasks.
+
+        :param sender: Mute only this sender, or mute all senders with
+            :data:`ANY`.
+
+        .. versionadded:: 1.10
+        """
+        sender_id = ANY_ID if sender is ANY else make_id(sender)
+        current = self._muted_senders.get()
+        muted_senders = frozenset((current or frozenset()) | {sender_id})
+        token = self._muted_senders.set(muted_senders)
+
+        try:
+            yield None
+        finally:
+            self._muted_senders.reset(token)
+
+    def _is_muted_for(self, sender: t.Any) -> bool:
+        if self.is_muted:
+            return True
+
+        muted_senders = self._muted_senders.get()
+
+        if not muted_senders:
+            return False
+
+        if ANY_ID in muted_senders:
+            return True
+
+        return make_id(sender) in muted_senders
+
     def send(
         self,
         sender: t.Any | None = None,
@@ -234,7 +278,7 @@ class Signal:
         .. versionchanged:: 1.7
             Added the ``_async_wrapper`` argument.
         """
-        if self.is_muted:
+        if self._is_muted_for(sender):
             return []
 
         results = []
@@ -284,7 +328,7 @@ class Signal:
 
         .. versionadded:: 1.7
         """
-        if self.is_muted:
+        if self._is_muted_for(sender):
             return []
 
         results = []

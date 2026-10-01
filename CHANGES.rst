@@ -3,6 +3,9 @@ Version 1.10.0
 
 Unreleased
 
+-   Add the ``Signal.muted_for`` context manager for context-local signal
+    muting, optionally limited to a specific sender.
+
 
 Version 1.9.0
 -------------

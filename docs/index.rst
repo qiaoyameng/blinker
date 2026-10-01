@@ -162,13 +162,24 @@ value``) pairs:
 Muting signals
 --------------
 
-To mute a signal, as may be required when testing, the
-:meth:`~Signal.muted` can be used as a context decorator:
+To mute a signal globally, as may be required when testing, use
+:meth:`~Signal.muted`. No receivers for that signal will be called in any
+thread or task while the context is active:
 
 .. code-block:: python
 
   sig = signal('send-data')
   with sig.muted():
+       ...
+
+To mute only sends from the current execution context, use
+:meth:`~Signal.muted_for`. By default it mutes all senders, but a specific
+``sender`` can be muted while other senders and other concurrent threads or
+tasks continue to call receivers:
+
+.. code-block:: python
+
+   with sig.muted_for(sender):
        ...
 
 
