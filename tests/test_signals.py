@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import collections.abc as c
 import gc
 import sys
@@ -498,3 +499,184 @@ def test_int_sender() -> None:
     assert count == 1
     sig.send(int("123456789"))  # Force different instance with same value.
     assert count == 2
+
+
+def test_send_robust() -> None:
+    sig = blinker.Signal()
+    calls = []
+
+    def first(sender: t.Any) -> str:
+        calls.append("first")
+        return "one"
+
+    def failing(sender: t.Any) -> None:
+        calls.append("failing")
+        raise ValueError("boom")
+
+    def third(sender: t.Any) -> str:
+        calls.append("third")
+        return "three"
+
+    sig.connect(first, weak=False)
+    sig.connect(failing, weak=False)
+    sig.connect(third, weak=False)
+
+    results = dict(sig.send_robust("sender"))
+
+    assert sorted(calls) == ["failing", "first", "third"]
+    assert len(results) == 3
+    assert results[first] == "one"
+    assert results[third] == "three"
+
+    err = results[failing]
+    assert isinstance(err, ValueError)
+    assert str(err) == "boom"
+    assert err.__traceback__ is not None
+
+
+def test_send_robust_base_exception_propagates() -> None:
+    sig = blinker.Signal()
+    calls = []
+
+    def interrupting(sender: t.Any) -> None:
+        calls.append("interrupting")
+        raise KeyboardInterrupt
+
+    def after(sender: t.Any) -> None:
+        calls.append("after")
+
+    sig.connect(interrupting, weak=False)
+    sig.connect(after, weak=False)
+
+    with pytest.raises(KeyboardInterrupt):
+        sig.send_robust()
+
+    assert calls == ["interrupting"]
+    assert "after" not in calls
+
+
+def test_send_robust_async_receiver_without_wrapper() -> None:
+    sig = blinker.Signal()
+
+    async def received_async(sender: t.Any) -> None:
+        pass
+
+    sig.connect(received_async, weak=False)
+
+    with pytest.raises(RuntimeError):
+        sig.send_robust()
+
+
+def test_send_robust_with_async_wrapper() -> None:
+    sig = blinker.Signal()
+
+    async def received_async(sender: t.Any) -> str:
+        return "async-result"
+
+    def wrapper(func: c.Callable[..., t.Any]) -> c.Callable[..., t.Any]:
+        def inner(*args: t.Any, **kwargs: t.Any) -> t.Any:
+            return asyncio.run(func(*args, **kwargs))
+
+        return inner
+
+    sig.connect(received_async, weak=False)
+    results = sig.send_robust(_async_wrapper=wrapper)
+    assert results == [(received_async, "async-result")]
+
+
+async def test_send_async_robust() -> None:
+    sig = blinker.Signal()
+    calls = []
+
+    async def first(sender: t.Any) -> str:
+        calls.append("first")
+        return "one"
+
+    async def failing(sender: t.Any) -> None:
+        calls.append("failing")
+        raise ValueError("boom")
+
+    async def third(sender: t.Any) -> str:
+        calls.append("third")
+        return "three"
+
+    sig.connect(first, weak=False)
+    sig.connect(failing, weak=False)
+    sig.connect(third, weak=False)
+
+    results = dict(await sig.send_async_robust("sender"))
+
+    assert sorted(calls) == ["failing", "first", "third"]
+    assert len(results) == 3
+    assert results[first] == "one"
+    assert results[third] == "three"
+
+    err = results[failing]
+    assert isinstance(err, ValueError)
+    assert str(err) == "boom"
+    assert err.__traceback__ is not None
+
+
+async def test_send_async_robust_cancelled() -> None:
+    class OrderedSet(dict):  # type: ignore[type-arg]
+        """A dict-backed ordered set, dispatching in connection order."""
+
+        def add(self, item: t.Any) -> None:
+            self[item] = None
+
+        def discard(self, item: t.Any) -> None:
+            self.pop(item, None)
+
+    class OrderedSignal(blinker.Signal):
+        set_class = OrderedSet
+
+    sig = OrderedSignal()
+    calls = []
+
+    async def first(sender: t.Any) -> None:
+        calls.append("first")
+
+    async def cancelling(sender: t.Any) -> None:
+        calls.append("cancelling")
+        raise asyncio.CancelledError
+
+    async def third(sender: t.Any) -> None:
+        calls.append("third")
+
+    sig.connect(first, weak=False)
+    sig.connect(cancelling, weak=False)
+    sig.connect(third, weak=False)
+
+    with pytest.raises(asyncio.CancelledError):
+        await sig.send_async_robust()
+
+    assert calls == ["first", "cancelling"]
+
+
+async def test_send_async_robust_sync_receiver_without_wrapper() -> None:
+    sig = blinker.Signal()
+
+    def received(sender: t.Any) -> None:
+        pass
+
+    sig.connect(received, weak=False)
+
+    with pytest.raises(RuntimeError):
+        await sig.send_async_robust()
+
+
+async def test_send_async_robust_with_sync_wrapper() -> None:
+    sig = blinker.Signal()
+
+    def received(sender: t.Any) -> str:
+        return "sync-result"
+
+    def wrapper(func: c.Callable[..., t.Any]) -> c.Callable[..., t.Any]:
+        async def inner(*args: t.Any, **kwargs: t.Any) -> t.Any:
+            return func(*args, **kwargs)
+
+        return inner
+
+    sig.connect(received, weak=False)
+    results = await sig.send_async_robust(_sync_wrapper=wrapper)
+    assert results == [(received, "sync-result")]

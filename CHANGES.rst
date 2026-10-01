@@ -3,6 +3,12 @@ Version 1.10.0
 
 Unreleased
 
+-   Add ``Signal.send_robust`` and ``Signal.send_async_robust``, which collect
+    each receiver's return value or raised ``Exception`` and continue calling
+    the remaining receivers instead of stopping at the first failure.
+    ``KeyboardInterrupt``, ``SystemExit``, and ``asyncio.CancelledError``
+    still propagate.
+
 
 Version 1.9.0
 -------------
