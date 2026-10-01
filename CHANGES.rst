@@ -3,6 +3,13 @@ Version 1.10.0
 
 Unreleased
 
+-   Add an optional ``priority`` argument when connecting receivers.
+    Receivers run in ascending priority order, and equal priorities retain
+    first-connection order. A specific sender's priority takes precedence
+    over an ``ANY`` subscription when both match. Each send snapshots matching
+    receivers and priorities before dispatch, so changes made during a send
+    start with the next send.
+
 
 Version 1.9.0
 -------------

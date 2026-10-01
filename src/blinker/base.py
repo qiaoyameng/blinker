@@ -32,8 +32,7 @@ class Signal:
 
     set_class: type[set[t.Any]] = set
     """The set class to use for tracking connected receivers and senders.
-    Python's ``set`` is unordered. If receivers must be dispatched in the order
-    they were connected, an ordered set implementation can be used.
+    Dispatch order is determined by receiver priority and registration order.
 
     .. versionadded:: 1.7
     """
@@ -86,9 +85,18 @@ class Signal:
         self.is_muted: bool = False
         self._by_receiver: dict[t.Any, set[t.Any]] = defaultdict(self.set_class)
         self._by_sender: dict[t.Any, set[t.Any]] = defaultdict(self.set_class)
+        self._priorities: dict[tuple[c.Hashable, c.Hashable], int] = {}
+        self._receiver_order: dict[t.Any, int] = {}
+        self._connection_count = 0
         self._weak_senders: dict[t.Any, weakref.ref[t.Any]] = {}
 
-    def connect(self, receiver: F, sender: t.Any = ANY, weak: bool = True) -> F:
+    def connect(
+        self,
+        receiver: F,
+        sender: t.Any = ANY,
+        weak: bool = True,
+        priority: int = 0,
+    ) -> F:
         """Connect ``receiver`` to be called when the signal is sent by
         ``sender``.
 
@@ -103,9 +111,21 @@ class Signal:
             be automatically disconnected when it is garbage collected. When
             connecting a receiver defined within a function, set to ``False``,
             otherwise it will be disconnected when the function scope ends.
+        :param priority: Call receivers in ascending priority order for a
+            sender. Receivers with the same priority are called in the order
+            they were first connected. If the receiver is connected to both
+            :data:`ANY` and a specific sender, the specific sender's priority
+            is used.
+
+        .. versionchanged:: 1.10
+            Added the ``priority`` argument.
         """
         receiver_id = make_id(receiver)
         sender_id = ANY_ID if sender is ANY else make_id(sender)
+
+        if receiver_id not in self.receivers:
+            self._connection_count += 1
+            self._receiver_order[receiver_id] = self._connection_count
 
         if weak:
             self.receivers[receiver_id] = make_ref(
@@ -116,6 +136,7 @@ class Signal:
 
         self._by_sender[sender_id].add(receiver_id)
         self._by_receiver[receiver_id].add(sender_id)
+        self._priorities[(sender_id, receiver_id)] = priority
 
         if sender is not ANY and sender_id not in self._weak_senders:
             # store a cleanup for weakref-able senders
@@ -129,7 +150,10 @@ class Signal:
         if "receiver_connected" in self.__dict__ and self.receiver_connected.receivers:
             try:
                 self.receiver_connected.send(
-                    self, receiver=receiver, sender=sender, weak=weak
+                    self,
+                    receiver=receiver,
+                    sender=sender,
+                    weak=weak,
                 )
             except TypeError:
                 # TODO no explanation or test for this
@@ -138,7 +162,9 @@ class Signal:
 
         return receiver
 
-    def connect_via(self, sender: t.Any, weak: bool = False) -> c.Callable[[F], F]:
+    def connect_via(
+        self, sender: t.Any, weak: bool = False, priority: int = 0
+    ) -> c.Callable[[F], F]:
         """Connect the decorated function to be called when the signal is sent
         by ``sender``.
 
@@ -154,19 +180,25 @@ class Signal:
             be automatically disconnected when it is garbage collected. When
             connecting a receiver defined within a function, set to ``False``,
             otherwise it will be disconnected when the function scope ends.=
+        :param priority: Call receivers in ascending priority order for a
+            sender. Receivers with the same priority are called in the order
+            they were first connected.
 
         .. versionadded:: 1.1
         """
 
         def decorator(fn: F) -> F:
-            self.connect(fn, sender, weak)
+            self.connect(fn, sender, weak, priority)
             return fn
 
         return decorator
 
     @contextmanager
     def connected_to(
-        self, receiver: c.Callable[..., t.Any], sender: t.Any = ANY
+        self,
+        receiver: c.Callable[..., t.Any],
+        sender: t.Any = ANY,
+        priority: int = 0,
     ) -> c.Generator[None, None, None]:
         """A context manager that temporarily connects ``receiver`` to the
         signal while a ``with`` block executes. When the block exits, the
@@ -178,10 +210,12 @@ class Signal:
         :param sender: Any object or :data:`ANY`. ``receiver`` will only be
             called when :meth:`send` is called with this sender. If ``ANY``, the
             receiver will be called for any sender.
+        :param priority: Call receivers in ascending priority order for a
+            sender.
 
         .. versionadded:: 1.1
         """
-        self.connect(receiver, sender=sender, weak=False)
+        self.connect(receiver, sender=sender, weak=False, priority=priority)
 
         try:
             yield None
@@ -217,8 +251,8 @@ class Signal:
         argument along with any extra keyword arguments. Return a list of
         ``(receiver, return value)`` tuples.
 
-        The order receivers are called is undefined, but can be influenced by
-        setting :attr:`set_class`.
+        Receivers are called in ascending priority order. Receivers with the
+        same priority are called in the order they were first connected.
 
         If a receiver raises an exception, that exception will propagate up.
         This makes debugging straightforward, with an assumption that correctly
@@ -233,6 +267,8 @@ class Signal:
 
         .. versionchanged:: 1.7
             Added the ``_async_wrapper`` argument.
+        .. versionchanged:: 1.10
+            Dispatch order is defined by priority and registration order.
         """
         if self.is_muted:
             return []
@@ -268,8 +304,8 @@ class Signal:
         argument along with any extra keyword arguments. Return a list of
         ``(receiver, return value)`` tuples.
 
-        The order receivers are called is undefined, but can be influenced by
-        setting :attr:`set_class`.
+        Receivers are called in ascending priority order. Receivers with the
+        same priority are called in the order they were first connected.
 
         If a receiver raises an exception, that exception will propagate up.
         This makes debugging straightforward, with an assumption that correctly
@@ -283,6 +319,8 @@ class Signal:
         :param kwargs: Extra keyword arguments to pass to each receiver.
 
         .. versionadded:: 1.7
+        .. versionchanged:: 1.10
+            Dispatch order is defined by priority and registration order.
         """
         if self.is_muted:
             return []
@@ -327,26 +365,50 @@ class Signal:
         self, sender: t.Any
     ) -> c.Generator[c.Callable[..., t.Any], None, None]:
         """Yield each receiver to be called for ``sender``, in addition to those
-        to be called for :data:`ANY`. Weakly referenced receivers that are not
-        live will be disconnected and skipped.
+        to be called for :data:`ANY`. The matching receivers and their
+        effective priorities are snapshotted before any receiver is called.
+        Connecting or disconnecting receivers, or changing receiver priorities,
+        while a send is in progress does not affect that send. Weakly
+        referenced receivers that are not live will be disconnected and
+        skipped.
 
         :param sender: Yield receivers connected to this sender, in addition
             to those connected to :data:`ANY`.
         """
-        # TODO: test receivers_for(ANY)
         if not self.receivers:
             return
 
-        sender_id = make_id(sender)
+        sender_id = ANY_ID if sender is ANY else make_id(sender)
+        entries: dict[c.Hashable, tuple[int, int]] = {}
 
-        if sender_id in self._by_sender:
-            ids = self._by_sender[ANY_ID] | self._by_sender[sender_id]
-        else:
-            ids = self._by_sender[ANY_ID].copy()
+        for receiver_id in self._by_sender[ANY_ID]:
+            order = self._receiver_order.get(receiver_id)
 
-        for receiver_id in ids:
-            receiver = self.receivers.get(receiver_id)
+            if order is not None:
+                entries[receiver_id] = (
+                    self._priorities.get((ANY_ID, receiver_id), 0),
+                    order,
+                )
 
+        if sender_id != ANY_ID:
+            for receiver_id in self._by_sender.get(sender_id, ()):
+                order = self._receiver_order.get(receiver_id)
+
+                if order is not None:
+                    entries[receiver_id] = (
+                        self._priorities.get((sender_id, receiver_id), 0),
+                        order,
+                    )
+
+        # Build the complete snapshot before invoking any receiver. Connecting,
+        # disconnecting, or changing priorities during a send affects later
+        # sends, but not the iteration that is already in progress.
+        snapshot = [
+            (receiver_id, self.receivers.get(receiver_id))
+            for receiver_id in sorted(entries, key=entries.__getitem__)
+        ]
+
+        for receiver_id, receiver in snapshot:
             if receiver is None:
                 continue
 
@@ -387,14 +449,19 @@ class Signal:
 
     def _disconnect(self, receiver_id: c.Hashable, sender_id: c.Hashable) -> None:
         if sender_id == ANY_ID:
-            if self._by_receiver.pop(receiver_id, None) is not None:
-                for bucket in self._by_sender.values():
-                    bucket.discard(receiver_id)
+            sender_ids = self._by_receiver.pop(receiver_id, None)
+
+            if sender_ids is not None:
+                for connected_sender_id in sender_ids:
+                    self._by_sender[connected_sender_id].discard(receiver_id)
+                    self._priorities.pop((connected_sender_id, receiver_id), None)
 
             self.receivers.pop(receiver_id, None)
+            self._receiver_order.pop(receiver_id, None)
         else:
             self._by_sender[sender_id].discard(receiver_id)
             self._by_receiver[receiver_id].discard(sender_id)
+            self._priorities.pop((sender_id, receiver_id), None)
 
     def _make_cleanup_receiver(
         self, receiver_id: c.Hashable
@@ -424,6 +491,7 @@ class Signal:
 
             for receiver_id in self._by_sender.pop(sender_id, ()):
                 self._by_receiver[receiver_id].discard(sender_id)
+                self._priorities.pop((sender_id, receiver_id), None)
 
         return cleanup
 
@@ -459,6 +527,9 @@ class Signal:
         self.receivers.clear()
         self._by_sender.clear()
         self._by_receiver.clear()
+        self._priorities.clear()
+        self._receiver_order.clear()
+        self._connection_count = 0
 
 
 class NamedSignal(Signal):

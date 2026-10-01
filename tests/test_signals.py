@@ -498,3 +498,239 @@ def test_int_sender() -> None:
     assert count == 1
     sig.send(int("123456789"))  # Force different instance with same value.
     assert count == 2
+
+
+def test_receiver_priority_and_registration_order() -> None:
+    calls: list[str] = []
+    sig = blinker.Signal()
+
+    def first_default(sender: t.Any) -> None:
+        calls.append("first-default")
+
+    def second_default(sender: t.Any) -> None:
+        calls.append("second-default")
+
+    def low_priority(sender: t.Any) -> None:
+        calls.append("low-priority")
+
+    sig.connect(low_priority, priority=1)
+    sig.connect(first_default)
+    sig.connect(second_default)
+
+    sig.send()
+
+    assert calls == [
+        "first-default",
+        "second-default",
+        "low-priority",
+    ]
+
+
+def test_connect_via_priority() -> None:
+    calls: list[str] = []
+    sig = blinker.Signal()
+    sender = object()
+
+    @sig.connect_via(sender, priority=1)
+    def low_priority(sender: t.Any) -> None:
+        calls.append("low-priority")
+
+    @sig.connect_via(sender)
+    def default_priority(sender: t.Any) -> None:
+        calls.append("default-priority")
+
+    sig.send(sender)
+    assert calls == ["default-priority", "low-priority"]
+
+
+def test_connected_to_priority() -> None:
+    calls: list[str] = []
+    sig = blinker.Signal()
+
+    def default_priority(sender: t.Any) -> None:
+        calls.append("default-priority")
+
+    def high_number_priority(sender: t.Any) -> None:
+        calls.append("high-number-priority")
+
+    sig.connect(default_priority)
+
+    with sig.connected_to(high_number_priority, priority=1):
+        sig.send()
+
+    assert calls == ["default-priority", "high-number-priority"]
+
+
+def test_specific_sender_priority_overrides_any_priority() -> None:
+    calls: list[str] = []
+    sig = blinker.Signal()
+    sender = object()
+
+    def any_only(sender: t.Any) -> None:
+        calls.append("any-only")
+
+    def shared(sender: t.Any) -> None:
+        calls.append("shared")
+
+    sig.connect(any_only, priority=-5)
+    sig.connect(shared, priority=100)
+    sig.connect(shared, sender=sender, priority=-10)
+
+    sig.send(sender)
+    assert calls == ["shared", "any-only"]
+
+    calls.clear()
+    sig.send(blinker.ANY)
+    assert calls == ["any-only", "shared"]
+
+    sig.connect(shared, sender=sender, priority=20)
+    sig.connect(shared, priority=0)
+
+    calls.clear()
+    sig.send(sender)
+    assert calls == ["any-only", "shared"]
+
+
+def test_reconnect_updates_priority_without_changing_equal_priority_order() -> None:
+    calls: list[str] = []
+    sig = blinker.Signal()
+
+    def first(sender: t.Any) -> None:
+        calls.append("first")
+
+    def second(sender: t.Any) -> None:
+        calls.append("second")
+
+    sig.connect(first)
+    sig.connect(second)
+
+    sig.send()
+    assert calls == ["first", "second"]
+
+    sig.connect(first, priority=1)
+    calls.clear()
+    sig.send()
+    assert calls == ["second", "first"]
+
+    sig.connect(first, priority=0)
+    calls.clear()
+    sig.send()
+    assert calls == ["first", "second"]
+
+    sig.disconnect(first)
+    sig.connect(first)
+    calls.clear()
+    sig.send()
+    assert calls == ["second", "first"]
+
+
+def test_send_uses_snapshot_when_receivers_change() -> None:
+    calls: list[str] = []
+    sig = blinker.Signal()
+
+    def added(sender: t.Any) -> None:
+        calls.append("added")
+
+    def first(sender: t.Any) -> None:
+        calls.append("first")
+        sig.connect(added, weak=False)
+
+    def second(sender: t.Any) -> None:
+        calls.append("second")
+        sig.disconnect(removed)
+
+    def removed(sender: t.Any) -> None:
+        calls.append("removed")
+
+    sig.connect(first)
+    sig.connect(second)
+    sig.connect(removed)
+
+    sig.send()
+    assert calls == ["first", "second", "removed"]
+
+    calls.clear()
+    sig.send()
+    assert calls == ["first", "second", "added"]
+
+
+def test_priority_change_during_send_starts_next_round() -> None:
+    calls: list[str] = []
+    sig = blinker.Signal()
+
+    def prioritized(sender: t.Any) -> None:
+        calls.append("prioritized")
+
+    def reprioritize(sender: t.Any) -> None:
+        calls.append("reprioritize")
+        sig.connect(prioritized, priority=-1)
+
+    sig.connect(prioritized, priority=1)
+    sig.connect(reprioritize, priority=0)
+
+    sig.send()
+    assert calls == ["reprioritize", "prioritized"]
+
+    calls.clear()
+    sig.send()
+    assert calls == ["prioritized", "reprioritize"]
+
+
+def test_dead_weak_receiver_is_cleaned_up_during_snapshot() -> None:
+    calls: list[str] = []
+    sig = blinker.Signal()
+    holder: list[c.Callable[..., None]] = []
+
+    def release_weak_receiver(sender: t.Any) -> None:
+        calls.append("first")
+        holder.clear()
+        collect_acyclic_refs()
+
+    def make_weak_receiver() -> c.Callable[..., None]:
+        def weak_receiver(sender: t.Any) -> None:
+            calls.append("weak")
+
+        return weak_receiver
+
+    holder.append(make_weak_receiver())
+    sig.connect(release_weak_receiver)
+    sig.connect(holder[0])
+
+    sig.send()
+    assert calls == ["first"]
+
+    calls.clear()
+    sig.send()
+    assert calls == ["first"]
+
+
+async def test_send_and_send_async_use_same_priority_order() -> None:
+    calls: list[str] = []
+    sig = blinker.Signal()
+
+    def first(sender: t.Any) -> None:
+        calls.append("first")
+
+    def second(sender: t.Any) -> None:
+        calls.append("second")
+
+    def third(sender: t.Any) -> None:
+        calls.append("third")
+
+    sig.connect(first, priority=-1)
+    sig.connect(second)
+    sig.connect(third, priority=1)
+
+    sig.send()
+    assert calls == ["first", "second", "third"]
+
+    calls.clear()
+
+    def wrapper(func: c.Callable[..., t.Any]) -> c.Callable[..., t.Any]:
+        async def inner(sender: t.Any) -> None:
+            func(sender)
+
+        return inner
+
+    await sig.send_async(_sync_wrapper=wrapper)
+    assert calls == ["first", "second", "third"]
