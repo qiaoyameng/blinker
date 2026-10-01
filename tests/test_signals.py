@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import collections.abc as c
 import gc
 import sys
@@ -55,7 +56,12 @@ def _test_signal_signals(sender: t.Any) -> None:
         expected = (
             "receiver_connected",
             sig,
-            {"receiver": receiver, "sender": sender, "weak": weak},
+            {
+                "receiver": receiver,
+                "sender": sender,
+                "weak": weak,
+                "priority": 0,
+            },
         )
 
         assert sentinel[-1] == expected
@@ -412,6 +418,227 @@ def test_no_double_send() -> None:
     assert sentinel == [None, 123]
     sig.send()
     assert sentinel == [None, 123, None]
+
+
+def test_receiver_priority_and_registration_order() -> None:
+    calls = []
+    sig = blinker.Signal()
+
+    def normal(sender: t.Any) -> None:
+        calls.append("normal")
+
+    def early(sender: t.Any) -> None:
+        calls.append("early")
+
+    def late(sender: t.Any) -> None:
+        calls.append("late")
+
+    sig.connect(normal, weak=False)
+    sig.connect(early, weak=False, priority=-10)
+    sig.connect(late, weak=False, priority=10)
+
+    sig.send()
+
+    assert calls == ["late", "normal", "early"]
+
+
+def test_connect_via_accepts_priority() -> None:
+    calls = []
+    sig = blinker.Signal()
+
+    @sig.connect_via("sender", priority=10)
+    def first(sender: t.Any) -> None:
+        calls.append("first")
+
+    @sig.connect_via("sender")
+    def second(sender: t.Any) -> None:
+        calls.append("second")
+
+    sig.send("sender")
+
+    assert calls == ["first", "second"]
+
+
+def test_specific_sender_priority_overrides_any() -> None:
+    calls = []
+    sig = blinker.Signal()
+
+    def shared(sender: t.Any) -> None:
+        calls.append("shared")
+
+    def any_only(sender: t.Any) -> None:
+        calls.append("any-only")
+
+    sig.connect(shared, weak=False, priority=10)
+    sig.connect(any_only, weak=False, priority=0)
+    sig.connect(shared, sender="match", weak=False, priority=-10)
+
+    sig.send("match")
+
+    assert calls == ["any-only", "shared"]
+
+    sig.send("other")
+    assert calls == ["any-only", "shared", "shared", "any-only"]
+
+
+def test_reconnect_updates_priority_without_changing_equal_order() -> None:
+    calls = []
+    sig = blinker.Signal()
+
+    def first(sender: t.Any) -> None:
+        calls.append("first")
+
+    def second(sender: t.Any) -> None:
+        calls.append("second")
+
+    def third(sender: t.Any) -> None:
+        calls.append("third")
+
+    sig.connect(first, weak=False)
+    sig.connect(second, weak=False)
+    sig.connect(third, weak=False)
+
+    sig.send()
+    assert calls == ["first", "second", "third"]
+
+    sig.connect(second, weak=False, priority=10)
+    calls.clear()
+    sig.send()
+    assert calls == ["second", "first", "third"]
+
+    sig.connect(second, weak=False)
+    calls.clear()
+    sig.send()
+    assert calls == ["first", "second", "third"]
+
+
+def test_send_snapshots_connection_changes_until_next_send() -> None:
+    calls = []
+    sig = blinker.Signal()
+
+    def added(sender: t.Any) -> None:
+        calls.append("added")
+
+    def first(sender: t.Any) -> None:
+        calls.append("first")
+        sig.disconnect(second)
+        sig.connect(added, weak=False)
+
+    def second(sender: t.Any) -> None:
+        calls.append("second")
+
+    sig.connect(first, weak=False)
+    sig.connect(second, weak=False)
+
+    sig.send()
+    assert calls == ["first", "second"]
+
+    calls.clear()
+    sig.send()
+    assert calls == ["first", "added"]
+
+
+def test_send_priority_change_applies_on_next_send() -> None:
+    calls = []
+    sig = blinker.Signal()
+
+    def first(sender: t.Any) -> None:
+        calls.append("first")
+        sig.connect(second, weak=False, priority=10)
+
+    def second(sender: t.Any) -> None:
+        calls.append("second")
+
+    sig.connect(first, weak=False)
+    sig.connect(second, weak=False)
+
+    sig.send()
+    assert calls == ["first", "second"]
+
+    calls.clear()
+    sig.send()
+    assert calls == ["second", "first"]
+
+
+async def test_send_async_priority_change_applies_on_next_send() -> None:
+    calls = []
+    sig = blinker.Signal()
+
+    async def first(sender: t.Any) -> None:
+        calls.append("first")
+        sig.connect(second, priority=10)
+
+    async def second(sender: t.Any) -> None:
+        calls.append("second")
+
+    sig.connect(first)
+    sig.connect(second)
+
+    await sig.send_async()
+    assert calls == ["first", "second"]
+
+    calls.clear()
+    await sig.send_async()
+    assert calls == ["second", "first"]
+
+
+def test_send_snapshot_skips_garbage_collected_weak_receiver() -> None:
+    calls = []
+    sig = blinker.Signal()
+    holder: list[t.Any] = []
+
+    class Receiver:
+        def receiver(self, sender: t.Any) -> None:
+            calls.append("receiver")
+
+    def cleanup(sender: t.Any) -> None:
+        calls.append("cleanup")
+        holder.clear()
+        collect_acyclic_refs()
+
+    sig.connect(cleanup, weak=False)
+    holder.append(Receiver())
+    sig.connect(holder[0].receiver, weak=True)
+
+    sig.send()
+
+    assert calls == ["cleanup"]
+    assert list(sig._by_receiver) == [id(cleanup)]
+
+
+def test_sync_and_async_send_use_same_receiver_order() -> None:
+    calls = []
+    sig = blinker.Signal()
+
+    def sync_receiver(sender: t.Any) -> None:
+        calls.append("sync")
+
+    async def async_receiver(sender: t.Any) -> None:
+        calls.append("async")
+
+    sig.connect(sync_receiver, weak=False)
+    sig.connect(async_receiver, priority=10)
+
+    def run_async(
+        func: c.Callable[..., c.Coroutine[t.Any, t.Any, t.Any]]
+    ) -> c.Callable[..., t.Any]:
+        def wrapper(*args: t.Any, **kwargs: t.Any) -> t.Any:
+            return asyncio.run(func(*args, **kwargs))
+
+        return wrapper
+
+    def run_sync(func: c.Callable[..., t.Any]) -> c.Callable[..., t.Any]:
+        async def wrapper(*args: t.Any, **kwargs: t.Any) -> None:
+            func(*args, **kwargs)
+
+        return wrapper
+
+    sig.send(_async_wrapper=run_async)
+    assert calls == ["async", "sync"]
+
+    calls.clear()
+    asyncio.run(sig.send_async(_sync_wrapper=run_sync))  # type: ignore[arg-type]
+    assert calls == ["async", "sync"]
 
 
 def test_has_receivers() -> None:

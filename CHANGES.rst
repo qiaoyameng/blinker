@@ -3,6 +3,14 @@ Version 1.10.0
 
 Unreleased
 
+-   Add an optional ``priority`` argument when connecting receivers. Higher
+    priorities are called first, and equal priorities retain registration
+    order. Sender-specific priorities override ``ANY`` priorities for the same
+    receiver.
+-   Call receivers from a snapshot taken when a send begins. Connection and
+    priority changes made during a send take effect on the next send, while
+    garbage-collected weak receivers are still cleaned up and skipped.
+
 
 Version 1.9.0
 -------------

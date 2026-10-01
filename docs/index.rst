@@ -334,22 +334,34 @@ event loop the following example can be used:
    await sig.send(_async_wrapper=wrapper)
 
 
-Call receivers in order of registration
----------------------------------------
+Receiver order and priority
+---------------------------
 
-It can be advantageous to call a signal's receivers in the order they
-were registered. To achieve this the storage class for receivers should
-be changed from an (unordered) set to an ordered set,
+Receivers with the same priority are called in the order of their earliest
+matching subscription. A numeric ``priority`` can be passed to
+:meth:`~Signal.connect`; receivers with a higher priority are called first.
+The default priority is ``0``.
 
 .. code-block:: python
 
-    from blinker import Signal
-    from ordered_set import OrderedSet
+    def add_context(sender, **kwargs):
+        ...
 
-    Signal.set_class = OrderedSet
+    def record_metric(sender, **kwargs):
+        ...
 
-Please note that ``ordered_set`` is a PyPI package and is not
-installed with blinker.
+    ready.connect(record_metric)
+    ready.connect(add_context, priority=10)
+
+If a receiver is connected to both a specific sender and :data:`ANY`, its
+sender-specific priority is used for that sender. Calling
+:meth:`~Signal.connect` again updates the priority without changing the
+receiver's tie-breaking registration order.
+
+The matching receivers are snapshotted when a send starts. Connecting or
+disconnecting receivers during a send takes effect on the next send. A
+weakly referenced receiver that is garbage collected before its snapshot
+entry is reached is still cleaned up and skipped.
 
 
 API Documentation
