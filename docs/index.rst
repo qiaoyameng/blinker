@@ -17,6 +17,7 @@ The core of Blinker is quite small but provides powerful features:
  - anonymous signals
  - custom name registries
  - permanently or temporarily connected receivers
+ - one-time receiver subscriptions
  - automatically disconnected receivers via weak referencing
  - sending arbitrary data payloads
  - collecting return values from signal receivers
@@ -130,6 +131,31 @@ This function has been subscribed to ``ready`` but only when sent by
   Got a signal sent by <Processor b>
   Caught signal from processor_b.
   Processing.
+
+
+One-time Subscriptions
+----------------------
+
+A receiver can be subscribed for one delivery by passing ``once=True`` to
+:meth:`~Signal.connect` or using :meth:`~Signal.connect_once`. The
+subscription is claimed before the receiver is entered, so a reentrant send
+from within the receiver cannot invoke it a second time. A receiver that
+raises still consumes its one delivery.
+
+.. code-block:: python
+
+  >>> ready_to_start = signal('ready-to-start')
+  >>> @ready_to_start.connect_once
+  ... def start_once(sender):
+  ...     print("Starting once.")
+  ...
+  >>> ready_to_start.send(1)
+  Starting once.
+  >>> ready_to_start.send(2)
+
+A one-time subscription may be restricted to a sender just like a regular
+subscription. Disconnecting or allowing a weakly referenced receiver or
+sender to be garbage collected still disconnects it normally.
 
 
 Sending and Receiving Data Through Signals

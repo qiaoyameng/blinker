@@ -3,6 +3,7 @@ from __future__ import annotations
 import collections.abc as c
 import gc
 import sys
+import threading
 import typing as t
 
 import pytest
@@ -478,6 +479,363 @@ def test_mute_signal() -> None:
     with sig.muted():
         sig.send(456)
     assert 456 not in sentinel
+
+
+@pytest.mark.parametrize("sender", [blinker.ANY, "ready"])
+def test_connect_once_reentrant(sender: t.Any) -> None:
+    sig = blinker.Signal()
+    calls = []
+
+    def received(actual_sender: t.Any, **kwargs: t.Any) -> None:
+        calls.append(actual_sender)
+        sig.send(sender, value=2)
+
+    sig.connect_once(received, sender=sender, weak=False)
+
+    sig.send(sender, value=1)
+
+    assert calls == [sender]
+
+    sig.send(sender, value=3)
+    assert calls == [sender]
+
+
+def test_connect_once_specific_sender_does_not_run_for_other_sender() -> None:
+    sig = blinker.Signal()
+    calls = []
+
+    def received(sender: t.Any) -> None:
+        calls.append(sender)
+
+    sig.connect_once(received, sender="first", weak=False)
+
+    sig.send("other")
+    assert calls == []
+
+    sig.send("first")
+    assert calls == ["first"]
+
+    sig.send("other")
+    sig.send("first")
+    assert calls == ["first"]
+
+
+def test_connect_once_is_consumed_when_receiver_raises() -> None:
+    sig = blinker.Signal()
+    calls = []
+
+    def received(sender: t.Any) -> None:
+        calls.append(sender)
+        raise RuntimeError("boom")
+
+    sig.connect_once(received, weak=False)
+
+    with pytest.raises(RuntimeError, match="boom"):
+        sig.send("first")
+
+    sig.send("second")
+    assert calls == ["first"]
+
+
+def test_connect_once_does_not_remove_normal_subscription() -> None:
+    sig = blinker.Signal()
+    calls = []
+
+    def received(sender: t.Any) -> None:
+        calls.append(("normal", sender))
+
+    sig.connect(received, sender="other", weak=False)
+    sig.connect_once(received, sender="ready", weak=False)
+
+    sig.send("ready")
+    sig.send("other")
+    sig.send("other")
+
+    assert calls == [
+        ("normal", "ready"),
+        ("normal", "other"),
+        ("normal", "other"),
+    ]
+
+
+def test_connect_once_keeps_normal_subscription_for_same_sender() -> None:
+    sig = blinker.Signal()
+    calls = []
+
+    def received(sender: t.Any) -> None:
+        calls.append(sender)
+
+    sig.connect(received, sender="ready", weak=False)
+    sig.connect_once(received, sender="ready", weak=False)
+
+    sig.send("ready")
+    sig.send("ready")
+
+    assert calls == ["ready", "ready"]
+
+
+def test_connect_once_specific_and_any_are_separate_registrations() -> None:
+    sig = blinker.Signal()
+    calls = []
+
+    def received(sender: t.Any) -> None:
+        calls.append(sender)
+
+    sig.connect_once(received, sender="ready", weak=False)
+    sig.connect_once(received, weak=False)
+
+    sig.send("other")
+    sig.send("ready")
+
+    assert calls == ["other", "ready"]
+
+
+def test_failed_one_time_connection_rolls_back_only_its_registration() -> None:
+    sig = blinker.Signal()
+    calls = []
+
+    def received(sender: t.Any) -> None:
+        calls.append(sender)
+
+    sig.connect(received, sender="ready", weak=False)
+
+    def connected_receiver(
+        signal: t.Any,
+        receiver: t.Any,
+        sender: t.Any,
+        weak: bool,
+    ) -> None:
+        raise TypeError
+
+    sig.receiver_connected.connect(connected_receiver, weak=False)
+
+    with pytest.raises(TypeError):
+        sig.connect_once(received, sender="ready", weak=False)
+
+    sig.send("ready")
+    sig.send("ready")
+
+    assert calls == ["ready", "ready"]
+
+
+def test_connect_once_manual_disconnect() -> None:
+    sig = blinker.Signal()
+    calls = []
+
+    def once_receiver(sender: t.Any) -> None:
+        calls.append(("once", sender))
+
+    def regular_receiver(sender: t.Any) -> None:
+        calls.append(("regular", sender))
+
+    sig.connect_once(once_receiver, sender="ready", weak=False)
+    sig.connect(regular_receiver, weak=False)
+
+    sig.disconnect(once_receiver, sender="ready")
+    sig.send("ready")
+
+    assert calls == [("regular", "ready")]
+
+
+def test_connect_once_weak_receiver() -> None:
+    sig = blinker.Signal()
+    calls = []
+
+    def received(sender: t.Any) -> None:
+        calls.append(sender)
+
+    sig.connect_once(received, weak=True)
+
+    del received
+    collect_acyclic_refs()
+
+    sig.send("ready")
+    assert calls == []
+
+
+def test_connect_once_weak_receiver_cleanup_after_call() -> None:
+    sig = blinker.Signal()
+    calls = []
+
+    def received(sender: t.Any) -> None:
+        calls.append(sender)
+
+    sig.connect_once(received, weak=True)
+
+    sig.send("ready")
+
+    assert calls == ["ready"]
+    assert not sig.receivers
+
+
+def test_connect_once_weak_sender() -> None:
+    sig = blinker.Signal()
+    calls = []
+
+    def received(sender: t.Any) -> None:
+        calls.append(sender)
+
+    class Sender:
+        pass
+
+    sender = Sender()
+    sig.connect_once(received, sender=sender, weak=False)
+
+    del sender
+    collect_acyclic_refs()
+
+    sig.send("ready")
+    assert calls == []
+    values_are_empty_sets_(sig._one_time_senders)
+
+
+def test_connect_once_decorator() -> None:
+    sig = blinker.Signal()
+    calls = []
+
+    @sig.connect_via("ready", once=True)
+    def received(sender: t.Any) -> None:
+        calls.append(sender)
+
+    sig.send("other")
+    sig.send("ready")
+    sig.send("ready")
+
+    assert calls == ["ready"]
+
+
+def test_connect_once_async_wrapper() -> None:
+    sig = blinker.Signal()
+    calls = []
+    wrapped = []
+
+    async def received(sender: t.Any) -> None:
+        calls.append(sender)
+
+    def wrapper(func: c.Callable[..., t.Any]) -> c.Callable[..., t.Any]:
+        wrapped.append(func)
+
+        def inner(*args: t.Any, **kwargs: t.Any) -> None:
+            coro = func(*args, **kwargs)
+            coro.close()
+
+        return inner
+
+    sig.connect_once(received, weak=False)
+
+    sig.send("ready", _async_wrapper=wrapper)
+    sig.send("ready", _async_wrapper=wrapper)
+
+    assert calls == []
+    assert len(wrapped) == 1
+
+
+async def test_connect_once_sync_wrapper_in_send_async() -> None:
+    sig = blinker.Signal()
+    calls = []
+    wrapped = []
+
+    def received(sender: t.Any) -> None:
+        calls.append(sender)
+
+    def wrapper(func: c.Callable[..., t.Any]) -> c.Callable[..., t.Any]:
+        wrapped.append(func)
+
+        async def inner(*args: t.Any, **kwargs: t.Any) -> None:
+            func(*args, **kwargs)
+
+        return inner
+
+    sig.connect_once(received, weak=False)
+
+    await sig.send_async("ready", _sync_wrapper=wrapper)
+    await sig.send_async("ready", _sync_wrapper=wrapper)
+
+    assert calls == ["ready"]
+    assert len(wrapped) == 1
+
+
+def test_connect_once_race_allows_only_one_call() -> None:
+    sig = blinker.Signal()
+    barrier = threading.Barrier(2)
+    calls = []
+    call_lock = threading.Lock()
+
+    def received(sender: t.Any) -> None:
+        with call_lock:
+            calls.append(sender)
+
+    sig.connect_once(received, weak=False)
+
+    original_claim = blinker.Signal._claim_once
+
+    def racing_claim(
+        signal: blinker.Signal,
+        signal_receiver: c.Callable[..., t.Any],
+        signal_sender: t.Any,
+    ) -> object:
+        barrier.wait()
+        return original_claim(signal, signal_receiver, signal_sender)
+
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        monkeypatch.setattr(blinker.Signal, "_claim_once", racing_claim)
+
+        errors = []
+
+        def worker(worker_sender: str) -> None:
+            try:
+                sig.send(worker_sender)
+            except BaseException as exc:  # pragma: no cover - test failure only
+                errors.append(exc)
+
+        first = threading.Thread(target=worker, args=("first",))
+        second = threading.Thread(target=worker, args=("second",))
+        first.start()
+        second.start()
+        first.join()
+        second.join()
+
+    assert errors == []
+    assert len(calls) == 1
+    assert calls[0] in {"first", "second"}
+
+
+def test_failed_once_claim_preserves_other_sender_subscription() -> None:
+    sig = blinker.Signal()
+    calls = []
+
+    def received(sender: t.Any) -> None:
+        calls.append(sender)
+
+    sig.connect_once(received, sender="ready", weak=False)
+    sig.connect(received, sender="other", weak=False)
+
+    sig.send("other")
+    assert calls == ["other"]
+
+    sig.send("ready")
+    assert calls == ["other", "ready"]
+
+    sig.send("other")
+    sig.send("ready")
+    assert calls == ["other", "ready", "other"]
+
+
+def test_claimed_any_once_preserves_specific_normal_subscription() -> None:
+    sig = blinker.Signal()
+    calls = []
+
+    def received(sender: t.Any) -> None:
+        calls.append(sender)
+
+    sig.connect_once(received, weak=False)
+    sig.connect(received, sender="ready", weak=False)
+
+    sig.send("ready")
+    sig.send("other")
+    sig.send("ready")
+
+    assert calls == ["ready", "ready"]
 
 
 def values_are_empty_sets_(dictionary: dict[t.Any, t.Any]) -> None:

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import collections.abc as c
 import sys
+import threading
 import typing as t
 import weakref
 from collections import defaultdict
@@ -19,6 +20,7 @@ ANY = Symbol("ANY")
 """Symbol for "any sender"."""
 
 ANY_ID = 0
+_SKIP = object()
 
 
 class Signal:
@@ -84,11 +86,20 @@ class Signal:
         """
 
         self.is_muted: bool = False
+        self._lock = threading.RLock()
         self._by_receiver: dict[t.Any, set[t.Any]] = defaultdict(self.set_class)
         self._by_sender: dict[t.Any, set[t.Any]] = defaultdict(self.set_class)
+        self._regular_senders: dict[t.Any, set[t.Any]] = {}
+        self._one_time_senders: dict[t.Any, set[t.Any]] = {}
         self._weak_senders: dict[t.Any, weakref.ref[t.Any]] = {}
 
-    def connect(self, receiver: F, sender: t.Any = ANY, weak: bool = True) -> F:
+    def connect(
+        self,
+        receiver: F,
+        sender: t.Any = ANY,
+        weak: bool = True,
+        once: bool = False,
+    ) -> F:
         """Connect ``receiver`` to be called when the signal is sent by
         ``sender``.
 
@@ -103,28 +114,37 @@ class Signal:
             be automatically disconnected when it is garbage collected. When
             connecting a receiver defined within a function, set to ``False``,
             otherwise it will be disconnected when the function scope ends.
+        :param once: Call the receiver only once for this registration. The
+            receiver is unregistered before it is called, so sending the signal
+            again from within it or from another thread will not call it again.
         """
         receiver_id = make_id(receiver)
         sender_id = ANY_ID if sender is ANY else make_id(sender)
 
-        if weak:
-            self.receivers[receiver_id] = make_ref(
-                receiver, self._make_cleanup_receiver(receiver_id)
-            )
-        else:
-            self.receivers[receiver_id] = receiver
-
-        self._by_sender[sender_id].add(receiver_id)
-        self._by_receiver[receiver_id].add(sender_id)
-
-        if sender is not ANY and sender_id not in self._weak_senders:
-            # store a cleanup for weakref-able senders
-            try:
-                self._weak_senders[sender_id] = make_ref(
-                    sender, self._make_cleanup_sender(sender_id)
+        with self._lock:
+            if weak:
+                self.receivers[receiver_id] = make_ref(
+                    receiver, self._make_cleanup_receiver(receiver_id)
                 )
-            except TypeError:
-                pass
+            else:
+                self.receivers[receiver_id] = receiver
+
+            self._by_sender[sender_id].add(receiver_id)
+            self._by_receiver[receiver_id].add(sender_id)
+
+            subscriptions = (
+                self._one_time_senders if once else self._regular_senders
+            )
+            subscriptions.setdefault(receiver_id, set()).add(sender_id)
+
+            if sender is not ANY and sender_id not in self._weak_senders:
+                # store a cleanup for weakref-able senders
+                try:
+                    self._weak_senders[sender_id] = make_ref(
+                        sender, self._make_cleanup_sender(sender_id)
+                    )
+                except TypeError:
+                    pass
 
         if "receiver_connected" in self.__dict__ and self.receiver_connected.receivers:
             try:
@@ -133,12 +153,29 @@ class Signal:
                 )
             except TypeError:
                 # TODO no explanation or test for this
-                self.disconnect(receiver, sender)
+                with self._lock:
+                    self._disconnect_registration(receiver_id, sender_id, once)
                 raise
 
         return receiver
 
-    def connect_via(self, sender: t.Any, weak: bool = False) -> c.Callable[[F], F]:
+    def connect_once(
+        self, receiver: F, sender: t.Any = ANY, weak: bool = True
+    ) -> F:
+        """Connect ``receiver`` to be called only once for this registration.
+
+        This is equivalent to calling :meth:`connect` with ``once=True``.
+
+        :param receiver: The callable to call when :meth:`send` is called with
+            the given ``sender``.
+        :param sender: Any object or :data:`ANY`.
+        :param weak: Track the receiver with a :mod:`weakref`.
+        """
+        return self.connect(receiver, sender=sender, weak=weak, once=True)
+
+    def connect_via(
+        self, sender: t.Any, weak: bool = False, once: bool = False
+    ) -> c.Callable[[F], F]:
         """Connect the decorated function to be called when the signal is sent
         by ``sender``.
 
@@ -154,12 +191,13 @@ class Signal:
             be automatically disconnected when it is garbage collected. When
             connecting a receiver defined within a function, set to ``False``,
             otherwise it will be disconnected when the function scope ends.=
+        :param once: Call the receiver only once for this registration.
 
         .. versionadded:: 1.1
         """
 
         def decorator(fn: F) -> F:
-            self.connect(fn, sender, weak)
+            self.connect(fn, sender, weak, once=once)
             return fn
 
         return decorator
@@ -240,6 +278,9 @@ class Signal:
         results = []
 
         for receiver in self.receivers_for(sender):
+            if self._claim_once(receiver, sender) == _SKIP:
+                continue
+
             if iscoroutinefunction(receiver):
                 if _async_wrapper is None:
                     raise RuntimeError("Cannot send to a coroutine function.")
@@ -290,6 +331,9 @@ class Signal:
         results = []
 
         for receiver in self.receivers_for(sender):
+            if self._claim_once(receiver, sender) == _SKIP:
+                continue
+
             if not iscoroutinefunction(receiver):
                 if _sync_wrapper is None:
                     raise RuntimeError("Cannot send to a non-coroutine function.")
@@ -354,7 +398,8 @@ class Signal:
                 strong = receiver()
 
                 if strong is None:
-                    self._disconnect(receiver_id, ANY_ID)
+                    with self._lock:
+                        self._disconnect(receiver_id, ANY_ID)
                     continue
 
                 yield strong
@@ -377,13 +422,52 @@ class Signal:
             sender_id = make_id(sender)
 
         receiver_id = make_id(receiver)
-        self._disconnect(receiver_id, sender_id)
+
+        with self._lock:
+            self._disconnect(receiver_id, sender_id)
 
         if (
             "receiver_disconnected" in self.__dict__
             and self.receiver_disconnected.receivers
         ):
             self.receiver_disconnected.send(self, receiver=receiver, sender=sender)
+
+    def _claim_once(
+        self, receiver: c.Callable[..., t.Any], sender: t.Any
+    ) -> bool | object:
+        receiver_id = make_id(receiver)
+        sender_id = make_id(sender)
+
+        with self._lock:
+            one_time_senders = self._one_time_senders.get(receiver_id)
+
+            regular_senders = self._regular_senders.get(receiver_id, set())
+
+            if not one_time_senders:
+                if sender_id in regular_senders or ANY_ID in regular_senders:
+                    return False
+
+                return _SKIP
+
+            if sender_id in one_time_senders:
+                claimed_sender_id = sender_id
+            elif ANY_ID in one_time_senders:
+                claimed_sender_id = ANY_ID
+            else:
+                if sender_id in regular_senders or ANY_ID in regular_senders:
+                    return False
+
+                return _SKIP
+
+            one_time_senders.discard(claimed_sender_id)
+
+            if not one_time_senders:
+                self._one_time_senders.pop(receiver_id, None)
+
+            if claimed_sender_id not in regular_senders:
+                self._remove_connection(receiver_id, claimed_sender_id)
+
+            return True
 
     def _disconnect(self, receiver_id: c.Hashable, sender_id: c.Hashable) -> None:
         if sender_id == ANY_ID:
@@ -392,9 +476,69 @@ class Signal:
                     bucket.discard(receiver_id)
 
             self.receivers.pop(receiver_id, None)
+            self._regular_senders.pop(receiver_id, None)
+            self._one_time_senders.pop(receiver_id, None)
         else:
             self._by_sender[sender_id].discard(receiver_id)
             self._by_receiver[receiver_id].discard(sender_id)
+
+            for subscriptions in (
+                self._regular_senders,
+                self._one_time_senders,
+            ):
+                sender_ids = subscriptions.get(receiver_id)
+
+                if sender_ids is not None:
+                    sender_ids.discard(sender_id)
+
+                    if not sender_ids:
+                        subscriptions.pop(receiver_id, None)
+
+    def _disconnect_registration(
+        self,
+        receiver_id: c.Hashable,
+        sender_id: c.Hashable,
+        once: bool,
+    ) -> None:
+        subscriptions = (
+            self._one_time_senders if once else self._regular_senders
+        )
+        sender_ids = subscriptions.get(receiver_id)
+
+        if sender_ids is None or sender_id not in sender_ids:
+            return
+
+        sender_ids.discard(sender_id)
+
+        if not sender_ids:
+            subscriptions.pop(receiver_id, None)
+
+        other_subscriptions = (
+            self._regular_senders if once else self._one_time_senders
+        )
+        other_sender_ids = other_subscriptions.get(receiver_id, set())
+
+        if sender_id not in other_sender_ids:
+            self._remove_connection(receiver_id, sender_id)
+
+    def _remove_connection(
+        self, receiver_id: c.Hashable, sender_id: c.Hashable
+    ) -> None:
+        self._by_sender[sender_id].discard(receiver_id)
+        remaining_sender_ids = self._by_receiver.get(receiver_id)
+
+        if remaining_sender_ids is None:
+            return
+
+        remaining_sender_ids.discard(sender_id)
+
+        if not remaining_sender_ids:
+            self._by_receiver.pop(receiver_id, None)
+
+            for bucket in self._by_sender.values():
+                bucket.discard(receiver_id)
+
+            self.receivers.pop(receiver_id, None)
 
     def _make_cleanup_receiver(
         self, receiver_id: c.Hashable
@@ -407,7 +551,8 @@ class Signal:
             # If the interpreter is shutting down, disconnecting can result in a
             # weird ignored exception. Don't call it in that case.
             if not sys.is_finalizing():
-                self._disconnect(receiver_id, ANY_ID)
+                with self._lock:
+                    self._disconnect(receiver_id, ANY_ID)
 
         return cleanup
 
@@ -420,10 +565,23 @@ class Signal:
         assert sender_id != ANY_ID
 
         def cleanup(ref: weakref.ref[t.Any]) -> None:
-            self._weak_senders.pop(sender_id, None)
+            with self._lock:
+                self._weak_senders.pop(sender_id, None)
 
-            for receiver_id in self._by_sender.pop(sender_id, ()):
-                self._by_receiver[receiver_id].discard(sender_id)
+                for receiver_id in self._by_sender.pop(sender_id, ()):
+                    self._by_receiver[receiver_id].discard(sender_id)
+
+                    for subscriptions in (
+                        self._regular_senders,
+                        self._one_time_senders,
+                    ):
+                        receiver_sender_ids = subscriptions.get(receiver_id)
+
+                        if receiver_sender_ids is not None:
+                            receiver_sender_ids.discard(sender_id)
+
+                            if not receiver_sender_ids:
+                                subscriptions.pop(receiver_id, None)
 
         return cleanup
 
@@ -459,6 +617,8 @@ class Signal:
         self.receivers.clear()
         self._by_sender.clear()
         self._by_receiver.clear()
+        self._regular_senders.clear()
+        self._one_time_senders.clear()
 
 
 class NamedSignal(Signal):

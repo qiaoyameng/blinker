@@ -3,6 +3,9 @@ Version 1.10.0
 
 Unreleased
 
+-   Add one-time receiver subscriptions with ``connect(once=True)`` and
+    ``Signal.connect_once``.
+
 
 Version 1.9.0
 -------------
