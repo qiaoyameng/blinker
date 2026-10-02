@@ -132,6 +132,29 @@ This function has been subscribed to ``ready`` but only when sent by
   Processing.
 
 
+Subscribing Once
+----------------
+
+Use :meth:`Signal.connect_once` to register a receiver that is called at
+most once, the first time the signal is sent by the given sender (or by
+any sender with the default :data:`ANY`). The registration disconnects
+itself automatically afterwards:
+
+.. code-block:: python
+
+  >>> def on_ready(sender):
+  ...     print("Resource is ready.")
+  ...
+  >>> ready.connect_once(on_ready, weak=False)
+  <function on_ready at 0x...>
+
+"Once" is counted per registration and is claimed before the receiver is
+called, so a re-entrant or concurrent :meth:`~Signal.send` cannot trigger
+a second call, and an exception raised by the receiver still consumes the
+single execution. Other subscriptions of the same function, such as ones
+made with :meth:`~Signal.connect`, are not affected.
+
+
 Sending and Receiving Data Through Signals
 ------------------------------------------
 

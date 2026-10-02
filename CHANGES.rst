@@ -3,6 +3,11 @@ Version 1.10.0
 
 Unreleased
 
+-   Add ``Signal.connect_once`` to subscribe a receiver that is called at
+    most once per registration. The single execution is claimed before the
+    receiver is called, so re-entrant or concurrent sends cannot trigger it
+    twice.
+
 
 Version 1.9.0
 -------------

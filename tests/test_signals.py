@@ -3,6 +3,7 @@ from __future__ import annotations
 import collections.abc as c
 import gc
 import sys
+import threading
 import typing as t
 
 import pytest
@@ -498,3 +499,234 @@ def test_int_sender() -> None:
     assert count == 1
     sig.send(int("123456789"))  # Force different instance with same value.
     assert count == 2
+
+
+def test_connect_once() -> None:
+    sentinel = []
+    sig = blinker.Signal()
+
+    def received(sender: t.Any) -> None:
+        sentinel.append(sender)
+
+    returned = sig.connect_once(received, weak=False)
+    assert returned is received
+
+    sig.send("a")
+    sig.send("b")
+    assert sentinel == ["a"]
+    assert not sig.receivers
+
+
+def test_connect_once_reentrant_send() -> None:
+    sentinel = []
+    sig = blinker.Signal()
+
+    def received(sender: t.Any) -> None:
+        sentinel.append(sender)
+        # A re-entrant send from within the receiver must not trigger a
+        # second execution.
+        sig.send("inner")
+
+    sig.connect_once(received, weak=False)
+    sig.send("outer")
+    assert sentinel == ["outer"]
+
+
+def test_connect_once_racing_threads() -> None:
+    sig = blinker.Signal()
+    sentinel = []
+    entered = threading.Event()
+    release = threading.Event()
+
+    def received(sender: t.Any) -> None:
+        entered.set()
+        # Hold the first send inside the receiver while the second thread
+        # sends concurrently.
+        assert release.wait(timeout=5)
+        sentinel.append(sender)
+
+    sig.connect_once(received, weak=False)
+
+    first = threading.Thread(target=sig.send, args=("sender",))
+    second = threading.Thread(target=sig.send, args=("sender",))
+
+    first.start()
+    assert entered.wait(timeout=5)
+    second.start()
+    second.join(timeout=5)
+    release.set()
+    first.join(timeout=5)
+
+    assert sentinel == ["sender"]
+
+
+def test_connect_once_simultaneous_threads() -> None:
+    for _ in range(50):
+        sig = blinker.Signal()
+        sentinel = []
+        barrier = threading.Barrier(2)
+
+        def received(sender: t.Any) -> None:
+            sentinel.append(sender)
+
+        def send() -> None:
+            barrier.wait()
+            sig.send("sender")
+
+        sig.connect_once(received, weak=False)
+        threads = [threading.Thread(target=send) for _ in range(2)]
+
+        for thread in threads:
+            thread.start()
+
+        for thread in threads:
+            thread.join(timeout=5)
+
+        assert sentinel == ["sender"]
+
+
+def test_connect_once_exception_consumes() -> None:
+    sig = blinker.Signal()
+    calls = 0
+
+    def received(sender: t.Any) -> None:
+        nonlocal calls
+        calls += 1
+        raise RuntimeError("boom")
+
+    sig.connect_once(received, weak=False)
+
+    with pytest.raises(RuntimeError):
+        sig.send("sender")
+
+    # The exception still consumed the single execution.
+    sig.send("sender")
+    assert calls == 1
+
+
+def test_connect_once_other_sender_not_removed() -> None:
+    sig = blinker.Signal()
+    sentinel = []
+
+    def received(sender: t.Any) -> None:
+        sentinel.append(sender)
+
+    sig.connect_once(received, sender="a", weak=False)
+    # Sending with a non-matching sender must not claim the execution or
+    # remove the registration.
+    sig.send("b")
+    assert not sentinel
+
+    sig.send("a")
+    assert sentinel == ["a"]
+
+    sig.connect_once(received, sender="a", weak=False)
+    sig.connect_once(received, sender="b", weak=False)
+    sig.send("a")
+    # The registration for "b" is a separate chance and must survive.
+    sig.send("b")
+    assert sentinel == ["a", "a", "b"]
+
+
+def test_connect_once_leaves_normal_subscription() -> None:
+    sig = blinker.Signal()
+    sentinel = []
+
+    def received(sender: t.Any) -> None:
+        sentinel.append(sender)
+
+    sig.connect(received, sender="a", weak=False)
+    sig.connect_once(received, sender="a", weak=False)
+
+    # Both the normal and the one-time subscription fire.
+    sig.send("a")
+    assert len(sentinel) == 2
+
+    # The normal subscription is not disconnected along with the one-time
+    # registration.
+    sig.send("a")
+    assert len(sentinel) == 3
+
+
+def test_connect_once_per_registration() -> None:
+    sig = blinker.Signal()
+    sentinel = []
+
+    def received(sender: t.Any) -> None:
+        sentinel.append(sender)
+
+    sig.connect_once(received, weak=False)
+    sig.connect_once(received, weak=False)
+
+    # Each registration gets its own single execution.
+    sig.send("a")
+    sig.send("a")
+    sig.send("a")
+    assert sentinel == ["a", "a"]
+
+
+def test_connect_once_weak() -> None:
+    sig = blinker.Signal()
+    sentinel = []
+
+    def received(sender: t.Any) -> None:
+        sentinel.append(sender)
+
+    sig.connect_once(received)
+    assert sig.receivers
+
+    del received
+    collect_acyclic_refs()
+    assert not sig.receivers
+
+    sig.send("a")
+    assert not sentinel
+
+
+def test_connect_once_disconnect() -> None:
+    sig = blinker.Signal()
+    sentinel = []
+
+    def received(sender: t.Any) -> None:
+        sentinel.append(sender)
+
+    sig.connect_once(received, weak=False)
+    sig.disconnect(received)
+    assert not sig.receivers
+    sig.send("a")
+    assert not sentinel
+
+    sig.connect_once(received, sender="a", weak=False)
+    sig.connect_once(received, sender="b", weak=False)
+    sig.disconnect(received, sender="a")
+    sig.send("a")
+    assert not sentinel
+    sig.send("b")
+    assert sentinel == ["b"]
+
+
+async def test_connect_once_async() -> None:
+    sig = blinker.Signal()
+    sentinel = []
+
+    def received(sender: t.Any) -> None:
+        sentinel.append(sender)
+
+    async def received_async(sender: t.Any) -> None:
+        sentinel.append(sender)
+
+    def sync_wrapper(func: c.Callable[..., t.Any]) -> c.Callable[..., t.Any]:
+        async def inner(*args: t.Any, **kwargs: t.Any) -> t.Any:
+            return func(*args, **kwargs)
+
+        return inner
+
+    sig.connect_once(received, weak=False)
+    await sig.send_async("a", _sync_wrapper=sync_wrapper)
+    await sig.send_async("a", _sync_wrapper=sync_wrapper)
+    assert sentinel == ["a"]
+
+    sig.connect_once(received_async, weak=False)
+    await sig.send_async("b")
+    await sig.send_async("b")
+    assert sentinel == ["a", "b"]

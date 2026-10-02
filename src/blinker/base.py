@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import collections.abc as c
 import sys
+import threading
 import typing as t
 import weakref
 from collections import defaultdict
@@ -19,6 +20,19 @@ ANY = Symbol("ANY")
 """Symbol for "any sender"."""
 
 ANY_ID = 0
+
+
+class _OnceRegistration:
+    """Bookkeeping for a single :meth:`Signal.connect_once` registration.
+    Each registration gets exactly one execution, independent of any other
+    subscription of the same callable.
+    """
+
+    __slots__ = ("claimed", "wrapper_id")
+
+    def __init__(self) -> None:
+        self.claimed: bool = False
+        self.wrapper_id: c.Hashable = 0
 
 
 class Signal:
@@ -87,6 +101,10 @@ class Signal:
         self._by_receiver: dict[t.Any, set[t.Any]] = defaultdict(self.set_class)
         self._by_sender: dict[t.Any, set[t.Any]] = defaultdict(self.set_class)
         self._weak_senders: dict[t.Any, weakref.ref[t.Any]] = {}
+        self._once_lock = threading.Lock()
+        self._once_registrations: dict[
+            tuple[c.Hashable, c.Hashable], list[_OnceRegistration]
+        ] = {}
 
     def connect(self, receiver: F, sender: t.Any = ANY, weak: bool = True) -> F:
         """Connect ``receiver`` to be called when the signal is sent by
@@ -163,6 +181,165 @@ class Signal:
             return fn
 
         return decorator
+
+    def connect_once(self, receiver: F, sender: t.Any = ANY, weak: bool = True) -> F:
+        """Connect ``receiver`` to be called only once, the first time the
+        signal is sent by ``sender``. After that first call, the registration
+        is automatically disconnected.
+
+        "Once" is counted per registration: each ``connect_once`` call gets
+        exactly one execution, and does not affect any other subscription of
+        the same callable, such as one made with :meth:`connect`.
+
+        The single execution is claimed atomically before ``receiver`` is
+        called, so a re-entrant :meth:`send` from within ``receiver``, or a
+        concurrent :meth:`send` from another thread, cannot trigger a second
+        call. If ``receiver`` raises an exception, the chance is still
+        considered consumed.
+
+        :param receiver: The callable to call at most once when :meth:`send`
+            is called with the given ``sender``.
+        :param sender: Any object or :data:`ANY`. ``receiver`` will only be
+            called when :meth:`send` is called with this sender. If ``ANY``,
+            the receiver will be called for the first sender seen.
+        :param weak: Track the receiver with a :mod:`weakref`. The
+            registration will be automatically disconnected when the receiver
+            is garbage collected. When connecting a receiver defined within a
+            function, set to ``False``, otherwise it will be disconnected when
+            the function scope ends.
+
+        .. versionadded:: 1.10
+        """
+        receiver_id = make_id(receiver)
+        sender_id = ANY_ID if sender is ANY else make_id(sender)
+        key = (receiver_id, sender_id)
+        registration = _OnceRegistration()
+
+        def claim() -> bool:
+            """Atomically consume this registration's single execution and
+            disconnect the wrapper. This runs before the receiver is called,
+            so an exception or re-entrant send cannot cause a second call.
+            """
+            with self._once_lock:
+                if registration.claimed:
+                    return False
+
+                registration.claimed = True
+                registrations = self._once_registrations.get(key)
+
+                if registrations is None or registration not in registrations:
+                    # Already disconnected before the chance was claimed.
+                    return False
+
+                registrations.remove(registration)
+
+                if not registrations:
+                    del self._once_registrations[key]
+
+                self._disconnect(registration.wrapper_id, ANY_ID)
+                return True
+
+        if weak:
+            receiver_ref = make_ref(
+                receiver, self._make_cleanup_once(key, registration)
+            )
+
+            def get_receiver() -> c.Callable[..., t.Any] | None:
+                return receiver_ref()
+
+        else:
+
+            def get_receiver() -> c.Callable[..., t.Any] | None:
+                return receiver
+
+        if iscoroutinefunction(receiver):
+
+            async def wrapper(sender: t.Any, **kwargs: t.Any) -> t.Any:
+                if not claim():
+                    return None
+
+                strong = get_receiver()
+
+                if strong is None:
+                    return None
+
+                return await strong(sender, **kwargs)
+
+        else:
+
+            def wrapper(sender: t.Any, **kwargs: t.Any) -> t.Any:
+                if not claim():
+                    return None
+
+                strong = get_receiver()
+
+                if strong is None:
+                    return None
+
+                return strong(sender, **kwargs)
+
+        registration.wrapper_id = make_id(wrapper)
+
+        with self._once_lock:
+            self._once_registrations.setdefault(key, []).append(registration)
+
+        self.connect(wrapper, sender, weak=False)
+        return receiver
+
+    def _make_cleanup_once(
+        self, key: tuple[c.Hashable, c.Hashable], registration: _OnceRegistration
+    ) -> c.Callable[[weakref.ref[t.Any]], None]:
+        """Create a callback function to disconnect a ``connect_once``
+        registration when its weakly referenced receiver is garbage collected.
+        """
+
+        def cleanup(ref: weakref.ref[t.Any]) -> None:
+            # If the interpreter is shutting down, disconnecting can result in
+            # a weird ignored exception. Don't call it in that case.
+            if not sys.is_finalizing():
+                self._remove_once(key, registration)
+
+        return cleanup
+
+    def _remove_once(
+        self, key: tuple[c.Hashable, c.Hashable], registration: _OnceRegistration
+    ) -> None:
+        """Forfeit a ``connect_once`` registration without executing it, and
+        disconnect its wrapper.
+        """
+        with self._once_lock:
+            registration.claimed = True
+            registrations = self._once_registrations.get(key)
+
+            if registrations is None or registration not in registrations:
+                return
+
+            registrations.remove(registration)
+
+            if not registrations:
+                del self._once_registrations[key]
+
+            self._disconnect(registration.wrapper_id, ANY_ID)
+
+    def _disconnect_once(self, receiver_id: c.Hashable, sender_id: c.Hashable) -> None:
+        """Forfeit ``connect_once`` registrations matching ``receiver_id`` and
+        ``sender_id``. Like :meth:`disconnect`, ``ANY_ID`` for ``sender_id``
+        matches registrations for all senders.
+        """
+        with self._once_lock:
+            if sender_id == ANY_ID:
+                keys = [k for k in self._once_registrations if k[0] == receiver_id]
+            else:
+                keys = (
+                    [(receiver_id, sender_id)]
+                    if (receiver_id, sender_id) in self._once_registrations
+                    else []
+                )
+
+            for key in keys:
+                for registration in self._once_registrations.pop(key):
+                    registration.claimed = True
+                    self._disconnect(registration.wrapper_id, ANY_ID)
 
     @contextmanager
     def connected_to(
@@ -378,6 +555,7 @@ class Signal:
 
         receiver_id = make_id(receiver)
         self._disconnect(receiver_id, sender_id)
+        self._disconnect_once(receiver_id, sender_id)
 
         if (
             "receiver_disconnected" in self.__dict__
@@ -459,6 +637,7 @@ class Signal:
         self.receivers.clear()
         self._by_sender.clear()
         self._by_receiver.clear()
+        self._once_registrations.clear()
 
 
 class NamedSignal(Signal):
